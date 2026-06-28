@@ -1,0 +1,8 @@
+# 复制为 .cargo/config.toml 并按你的机器填写路径。
+# FFMPEG_DIR: 解压后的 FFmpeg 7.1.x「shared」开发包根目录（内含 include/ 和 lib/）。
+#   推荐 gyan.dev 的 ffmpeg-7.1.1-full_build-shared。务必是 7.1.x —— 8.x 会让 ffmpeg-next
+#   的安全层出现非穷尽 match 编译错误。
+# LIBCLANG_PATH: LLVM 的 bin 目录（bindgen 需要 libclang）。
+[env]
+FFMPEG_DIR = 'C:\path\to\ffmpeg-7.1.1-full_build-shared'
+LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
