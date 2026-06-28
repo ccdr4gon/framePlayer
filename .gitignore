@@ -1,0 +1,6 @@
+/target
+/third_party
+/test_assets
+
+# 机器相关的本地构建配置（含本机绝对路径）。见 .cargo/config.toml.example
+/.cargo/config.toml
