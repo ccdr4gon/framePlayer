@@ -126,6 +126,9 @@ pub struct FramePlayerApp {
 
     /// 上一帧观测到的尺寸（判断用户在拖哪一维做比例锁定缩放）
     prev_size: Option<egui::Vec2>,
+    /// 手动拖窗：拖动期间累积的目标外位置（逻辑点）；None = 未在拖动。
+    /// 自己移动窗口（OuterPosition）而不走系统移动循环，避免触发 Win11 自动吸附。
+    drag_win_pos: Option<egui::Pos2>,
     /// 进入沉浸的时刻（用于提示渐隐）
     immersive_since: f64,
 
@@ -202,6 +205,7 @@ impl FramePlayerApp {
             resume_saved_t: 0.0,
             fit_pending: false,
             prev_size: None,
+            drag_win_pos: None,
             immersive_since: 0.0,
             proxy_cache_max_mb: config.proxy_cache_max_mb,
             hwnd,
@@ -683,12 +687,29 @@ impl FramePlayerApp {
                 let bar = ui.max_rect();
                 let drag = ui.interact(bar, egui::Id::new("title_drag"), egui::Sense::click_and_drag());
                 drag.surrender_focus(); // 标题栏拖拽区不持有键盘焦点
-                if drag.drag_started_by(egui::PointerButton::Primary) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
+                // 手动移动窗口（不走系统移动循环），避免拖到屏幕边缘触发 Win11 自动吸附。
+                let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 if drag.double_clicked() {
-                    let max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!max));
+                    self.drag_win_pos = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                } else if maximized {
+                    self.drag_win_pos = None; // 最大化时不手动移动
+                } else {
+                    if drag.drag_started_by(egui::PointerButton::Primary) {
+                        self.drag_win_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+                    }
+                    if drag.dragged_by(egui::PointerButton::Primary) {
+                        if let Some(pos) = self.drag_win_pos.as_mut() {
+                            // 用原始鼠标位移(物理像素)累积到锚点，除以缩放转逻辑点；
+                            // 不每帧回读 outer_rect（OuterPosition 异步生效会滞后导致抖动）。
+                            *pos += drag.drag_motion() / ctx.pixels_per_point();
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(*pos));
+                            ctx.request_repaint();
+                        }
+                    }
+                    if drag.drag_stopped() {
+                        self.drag_win_pos = None;
+                    }
                 }
 
                 let maxed = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
@@ -802,7 +823,13 @@ impl FramePlayerApp {
                                 let resp =
                                     ui.add(egui::Slider::new(&mut pos, 0..=last).show_value(false));
                                 resp.surrender_focus(); // 不抢键盘焦点，避免拖完进度条后 Tab 失效
-                                if resp.dragged() {
+                                if self.using_proxy {
+                                    // 代理是全 I 帧、任意帧即时：直接精确，不做关键帧预览
+                                    // （否则点/拖时会先闪一下关键帧再精确）
+                                    if resp.dragged() || resp.changed() || resp.drag_stopped() {
+                                        self.request(pos, false);
+                                    }
+                                } else if resp.dragged() {
                                     self.request(pos, true); // 拖动中：关键帧快速预览
                                 } else if resp.changed() || resp.drag_stopped() {
                                     // 点击 / 松手：先给关键帧即时反馈，再精确（合并：精确排在预览之后）
@@ -1247,8 +1274,19 @@ impl eframe::App for FramePlayerApp {
                 egui::Id::new("immersive_move"),
                 egui::Sense::click_and_drag(),
             );
+            // 手动移动窗口，避免触发 Win11 自动吸附（与标题栏同一套逻辑）。
             if resp.drag_started_by(egui::PointerButton::Primary) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                self.drag_win_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+            }
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                if let Some(pos) = self.drag_win_pos.as_mut() {
+                    *pos += resp.drag_motion() / ctx.pixels_per_point();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(*pos));
+                    ctx.request_repaint();
+                }
+            }
+            if resp.drag_stopped() {
+                self.drag_win_pos = None;
             }
             if resp.double_clicked() {
                 self.set_immersive(&ctx, false); // 双击退出沉浸
