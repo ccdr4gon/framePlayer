@@ -51,12 +51,18 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([960.0, 600.0])
+        .with_min_inner_size([480.0, 320.0])
+        .with_decorations(false) // 自绘标题栏；沉浸模式可彻底隐藏（连关闭按钮一起）
+        .with_title("Frame Player");
+    // 运行时窗口图标（任务栏/Alt-Tab）；固定到任务栏的图标由 build.rs 嵌入的资源提供。
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 600.0])
-            .with_min_inner_size([480.0, 320.0])
-            .with_decorations(false) // 自绘标题栏；沉浸模式可彻底隐藏（连关闭按钮一起）
-            .with_title("Frame Player"),
+        viewport,
         ..Default::default()
     };
 

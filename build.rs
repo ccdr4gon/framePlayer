@@ -3,7 +3,18 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+
+    // 把应用图标嵌入 exe 资源：固定到任务栏/资源管理器才会显示图标（而非默认占位图）。
+    #[cfg(windows)]
+    {
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        if let Err(e) = res.compile() {
+            println!("cargo:warning=嵌入图标失败: {e}");
+        }
+    }
 
     let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") else {
         return;
