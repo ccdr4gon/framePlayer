@@ -1,6 +1,6 @@
 [package]
 name = "frame_player"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 
 [dependencies]
@@ -24,3 +24,7 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
+
+[build-dependencies]
+# 把 assets/icon.ico 嵌入 exe 的资源，使资源管理器/任务栏(固定)显示应用图标。
+winresource = "0.1"
