@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 /// 让转码进程以「低于正常」优先级运行，给键盘钩子等让出 CPU。
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+/// 不为子进程创建控制台窗口：GUI 程序(无控制台)spawn 控制台版 ffmpeg.exe 时，
+/// Windows 默认会弹一个 terminal 窗口；加此标志即可不弹窗。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub enum ProxyMsg {
     Progress(f32), // 0.0..=1.0
@@ -59,9 +62,8 @@ fn canonical_key(source: &Path) -> String {
     s.to_lowercase()
 }
 
-/// 按「规范化源路径 + 大小 + 修改时间」给该源生成稳定的代理文件名。
-pub fn proxy_path_for(source: &Path) -> Option<PathBuf> {
-    let dir = cache_dir()?;
+/// 按「规范化源路径 + 大小 + 修改时间」给该源生成稳定的哈希（代理/续播记录共用）。
+fn file_hash(source: &Path) -> Option<u64> {
     let meta = std::fs::metadata(source).ok()?;
     let modified = meta
         .modified()
@@ -73,7 +75,30 @@ pub fn proxy_path_for(source: &Path) -> Option<PathBuf> {
     canonical_key(source).hash(&mut h);
     meta.len().hash(&mut h);
     modified.hash(&mut h);
-    Some(dir.join(format!("proxy-{:016x}.mp4", h.finish())))
+    Some(h.finish())
+}
+
+/// 该源对应的全 I 帧代理文件名。
+pub fn proxy_path_for(source: &Path) -> Option<PathBuf> {
+    Some(cache_dir()?.join(format!("proxy-{:016x}.mp4", file_hash(source)?)))
+}
+
+fn resume_dir() -> Option<PathBuf> {
+    Some(cache_dir()?.parent()?.join("resume"))
+}
+
+/// 读取该源「上次播放到第几帧」。无记录返回 None。
+pub fn load_resume(source: &Path) -> Option<u64> {
+    let p = resume_dir()?.join(format!("{:016x}.txt", file_hash(source)?));
+    std::fs::read_to_string(p).ok()?.trim().parse().ok()
+}
+
+/// 记录该源当前播放到第几帧（每个文件一个小文件，多窗口下最后写入者获胜）。
+pub fn save_resume(source: &Path, frame: u64) {
+    let Some(h) = file_hash(source) else { return };
+    let Some(dir) = resume_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join(format!("{h:016x}.txt")), frame.to_string());
 }
 
 /// 已存在且非空的代理视为可用。
@@ -203,7 +228,7 @@ fn run(
         .arg(threads.to_string())
         .args(["-progress", "pipe:1", "-nostats"])
         .arg(&tmp)
-        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS)
+        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

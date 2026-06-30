@@ -167,7 +167,8 @@ unsafe fn hotkey_thread() {
     log::info!("全局热键线程已启动（RegisterHotKey）");
 
     let mut registered: Vec<(i32, Binding)> = Vec::new();
-    reconcile(&mut registered);
+    let mut logged_fail: Vec<Binding> = Vec::new(); // 已记过日志的失败键，避免重试刷屏
+    reconcile(&mut registered, &mut logged_fail);
 
     while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
         match msg.message {
@@ -184,7 +185,7 @@ unsafe fn hotkey_thread() {
                     });
                 }
             }
-            WM_RECONCILE => reconcile(&mut registered),
+            WM_RECONCILE => reconcile(&mut registered, &mut logged_fail),
             _ => {}
         }
     }
@@ -195,8 +196,9 @@ unsafe fn hotkey_thread() {
 }
 
 /// 把「期望注册的热键」与「已注册的」对账：注销多余/变动的，注册缺失/失败重试的。
-/// 期望集合 = 激活且非捕获时的当前键位表；否则为空。
-fn reconcile(registered: &mut Vec<(i32, Binding)>) {
+/// 期望集合 = 激活且非捕获时的当前键位表；否则为空。`logged_fail` 记录已打过日志的
+/// 失败键，使被占用的热键每次静默重试、只在首次失败时记一条 warn（不刷屏）。
+fn reconcile(registered: &mut Vec<(i32, Binding)>, logged_fail: &mut Vec<Binding>) {
     let want = WANT_ACTIVE.load(Ordering::Relaxed) && !CAPTURING.load(Ordering::Relaxed);
     let desired: Vec<Binding> = if want {
         BINDINGS
@@ -237,14 +239,24 @@ fn reconcile(registered: &mut Vec<(i32, Binding)>) {
             m |= MOD_SHIFT.0;
         }
         match unsafe { RegisterHotKey(None, id, HOT_KEY_MODIFIERS(m), b.vk) } {
-            Ok(()) => registered.push((id, *b)),
-            Err(e) => log::warn!(
-                "RegisterHotKey 失败 {} [{}]：{e}（可能被其它程序/系统占用，下次重试）",
-                chord_label(b),
-                b.action.label()
-            ),
+            Ok(()) => {
+                registered.push((id, *b));
+                logged_fail.retain(|f| !same_chord(f, b)); // 注册成功 → 允许将来再次失败时记日志
+            }
+            Err(e) => {
+                if !logged_fail.iter().any(|f| same_chord(f, b)) {
+                    log::warn!(
+                        "RegisterHotKey 失败 {} [{}]：{e}（可能被其它程序/系统占用，会静默重试）",
+                        chord_label(b),
+                        b.action.label()
+                    );
+                    logged_fail.push(*b);
+                }
+            }
         }
     }
+    // 清掉已不再期望的失败记录，使其下次被加回并失败时仍会记一次日志
+    logged_fail.retain(|f| desired.iter().any(|d| same_chord(d, f)));
 }
 
 fn is_modifier(vk: u32) -> bool {
