@@ -116,6 +116,11 @@ pub struct FramePlayerApp {
     proxy_cancel: Option<Arc<AtomicBool>>,
     /// 切换到代理后要恢复到的帧
     restore_frame: Option<u64>,
+    /// 打开新文件时待恢复的「上次播放到的帧」（续播）
+    pending_resume: Option<u64>,
+    /// 上次写入续播记录的帧 + 时刻（节流写盘）
+    resume_saved_frame: u64,
+    resume_saved_t: f64,
     /// 打开后待执行「按视频比例自适应窗口」
     fit_pending: bool,
 
@@ -192,6 +197,9 @@ impl FramePlayerApp {
             proxy_progress: None,
             proxy_cancel: None,
             restore_frame: None,
+            pending_resume: None,
+            resume_saved_frame: 0,
+            resume_saved_t: 0.0,
             fit_pending: false,
             prev_size: None,
             immersive_since: 0.0,
@@ -275,11 +283,19 @@ impl FramePlayerApp {
     /// 打开指定路径的视频（文件对话框 / 命令行 / 拖拽 共用）。
     /// 若该源已存在全 I 帧代理，则自动改用代理（跳转即时）。
     fn open_path(&mut self, source: PathBuf) {
+        // 切走前先记下上一个文件的播放位置
+        if let Some(old) = self.source_file.clone() {
+            if self.total_frames > 0 {
+                proxy::save_resume(&old, self.current_frame);
+            }
+        }
         self.cancel_proxy(); // 打开新文件：中止上一个文件的转码
         self.source_file = Some(source.clone());
         self.file = Some(source.clone());
         self.tex = None;
         self.restore_frame = None;
+        // 读取这个文件的上次播放位置，Opened 时跳过去续播
+        self.pending_resume = proxy::load_resume(&source).filter(|&f| f > 0);
         self.fit_pending = true; // 打开后按视频比例自适应窗口
         let (to_open, using) = match proxy::existing_proxy(&source) {
             Some(p) => (p, true),
@@ -503,10 +519,17 @@ impl FramePlayerApp {
                     if !self.using_proxy {
                         self.status.clear();
                     }
-                    // 切换到代理后回到原先所在帧
-                    if let Some(f) = self.restore_frame.take() {
-                        self.request(f.min(total_frames.saturating_sub(1)), false);
+                    // 跳转到目标帧：切代理→回原帧；首次打开→上次续播帧。
+                    let seek = self
+                        .restore_frame
+                        .take()
+                        .or_else(|| self.pending_resume.take());
+                    if let Some(f) = seek {
+                        let f = f.min(total_frames.saturating_sub(1));
+                        self.current_frame = f; // 乐观置位，避免续播帧到达前被周期保存覆盖成 0
+                        self.request(f, false);
                     }
+                    self.resume_saved_frame = self.current_frame; // 同步，开局不立刻回写
                     // 按视频比例自适应窗口（消除黑边）
                     if std::mem::take(&mut self.fit_pending) {
                         self.fit_window_to_video(ctx);
@@ -1035,6 +1058,17 @@ impl eframe::App for FramePlayerApp {
         let ctx = ui.ctx().clone();
         self.drain_decoder(&ctx);
         self.drain_proxy();
+        // 续播：当前帧变化且距上次写盘 >0.3s 时记录播放位置（关掉/下次打开从这里续）
+        if self.total_frames > 0 && self.current_frame != self.resume_saved_frame {
+            let now = ctx.input(|i| i.time);
+            if now - self.resume_saved_t > 0.3 {
+                if let Some(src) = self.source_file.clone() {
+                    proxy::save_resume(&src, self.current_frame);
+                }
+                self.resume_saved_frame = self.current_frame;
+                self.resume_saved_t = now;
+            }
+        }
         // 多窗口全局热键归属：维护本进程「是否激活」状态（含轻量心跳重绘）
         self.update_active_window(&ctx);
         // 反应式空闲时，在指定时间窗内持续重绘，保证双击第二击能被采样到
