@@ -126,9 +126,22 @@ pub struct FramePlayerApp {
 
     /// 上一帧观测到的尺寸（判断用户在拖哪一维做比例锁定缩放）
     prev_size: Option<egui::Vec2>,
-    /// 手动拖窗：拖动期间累积的目标外位置（逻辑点）；None = 未在拖动。
+    /// 手动拖窗：拖动开始时「光标屏幕位置 − 窗口左上角」的偏移（逻辑点）；None = 未在拖动。
     /// 自己移动窗口（OuterPosition）而不走系统移动循环，避免触发 Win11 自动吸附。
-    drag_win_pos: Option<egui::Pos2>,
+    /// 跟随真实光标位置（GetCursorPos）而非原始鼠标位移：位移经过系统指针加速会和光标
+    /// 实际移动不一致（窗口跟不上鼠标），且数位板是绝对定位、根本没有位移事件。
+    drag_offset: Option<egui::Vec2>,
+    /// 窗口不透明度 0.2..=1.0（沉浸模式 Ctrl+滚轮调节；退出沉浸恢复不透明）
+    opacity: f32,
+    /// 滚轮缩放的在途目标（尺寸/位置）：InnerSize/OuterPosition 异步生效，连续滚动
+    /// 必须以目标为基数累积；用滞后的实际尺寸重算会回退/打架，表现为一顿一顿。
+    zoom_size_target: Option<egui::Vec2>,
+    zoom_pos_target: Option<egui::Pos2>,
+    /// 动画已推进到的（位置,尺寸）：每帧小步趋近目标——一步到位的 8% 突变会在
+    /// 合成器上露出旧帧拉伸（闪烁），小步多帧和系统边缘拖拽缩放一样平滑。
+    zoom_applied: Option<(egui::Pos2, egui::Vec2)>,
+    /// 最近一次滚轮缩放时刻（静默 0.3s 后清除在途目标、恢复比例纠正）
+    zoom_last_t: f64,
     /// 进入沉浸的时刻（用于提示渐隐）
     immersive_since: f64,
 
@@ -205,7 +218,12 @@ impl FramePlayerApp {
             resume_saved_t: 0.0,
             fit_pending: false,
             prev_size: None,
-            drag_win_pos: None,
+            drag_offset: None,
+            opacity: 1.0,
+            zoom_size_target: None,
+            zoom_pos_target: None,
+            zoom_applied: None,
+            zoom_last_t: 0.0,
             immersive_since: 0.0,
             proxy_cache_max_mb: config.proxy_cache_max_mb,
             hwnd,
@@ -223,6 +241,63 @@ impl FramePlayerApp {
         // 启动时按上限压一次代理缓存（清理历史/孤立的代理）
         proxy::evict_cache(app.proxy_cache_max_mb);
         app
+    }
+
+    /// 设置整窗不透明度（0.2..=1.0）。用分层窗口的 LWA_ALPHA：DWM 合成期生效，
+    /// 不影响 wgpu 渲染；恢复到 1.0 时移除分层样式，回到普通窗口路径。
+    fn set_window_opacity(&mut self, opacity: f32) {
+        use windows::Win32::Foundation::{COLORREF, HWND};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE,
+            LWA_ALPHA, WS_EX_LAYERED,
+        };
+        let Some(h) = self.hwnd else { return };
+        self.opacity = opacity.clamp(0.2, 1.0);
+        let hwnd = HWND(h as *mut core::ffi::c_void);
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if self.opacity >= 0.999 {
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED.0 as isize));
+            } else {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+                let _ = SetLayeredWindowAttributes(
+                    hwnd,
+                    COLORREF(0),
+                    (self.opacity * 255.0) as u8,
+                    LWA_ALPHA,
+                );
+            }
+        }
+    }
+
+    /// 一次 SetWindowPos 原子地移动+缩放窗口（参数为逻辑点）。分开发 OuterPosition/
+    /// InnerSize 会被 winit 拆成两次 SetWindowPos，两次合成之间出现「先挪后缩」的
+    /// 中间态（闪烁）；NOCOPYBITS/DEFERERASE 再抑制旧内容拷贝与背景擦除的闪动。
+    /// 无边框窗口外尺寸 == 客户区尺寸，可直接用 InnerSize 的值。
+    fn move_resize_atomic(&self, ctx: &egui::Context, pos: egui::Pos2, size: egui::Vec2) {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_DEFERERASE, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
+        };
+        if let Some(h) = self.hwnd {
+            let ppp = ctx.pixels_per_point();
+            let px = |v: f32| (v * ppp).round() as i32;
+            unsafe {
+                let _ = SetWindowPos(
+                    HWND(h as *mut core::ffi::c_void),
+                    None,
+                    px(pos.x),
+                    px(pos.y),
+                    px(size.x),
+                    px(size.y),
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | SWP_DEFERERASE,
+                );
+            }
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
     }
 
     /// 本窗口是否为系统前台窗口。用 GetForegroundWindow 比 egui 的 i.focused 更可靠
@@ -613,6 +688,9 @@ impl FramePlayerApp {
             return;
         }
         self.immersive = on;
+        self.zoom_size_target = None;
+        self.zoom_pos_target = None;
+        self.zoom_applied = None;
         if on {
             self.show_settings = false;
             self.prev_size = None;
@@ -620,6 +698,9 @@ impl FramePlayerApp {
         } else {
             // 退出沉浸：保持沉浸中调整后的大小，不再恢复进入前的尺寸
             self.prev_size = None;
+            if self.opacity < 1.0 {
+                self.set_window_opacity(1.0); // 透明度只在沉浸模式内生效
+            }
         }
     }
 
@@ -628,6 +709,11 @@ impl FramePlayerApp {
     /// 因此拖任意边/角都能改变大小。
     fn enforce_immersive_aspect(&mut self, ctx: &egui::Context) {
         if self.vid_w == 0 || self.vid_h == 0 {
+            return;
+        }
+        // 滚轮缩放在途：缩放本身就是等比的，不做纠正——用滞后的实际尺寸去"纠正"
+        // 会和还没生效的缩放命令互相打架（窗口来回跳）。
+        if self.zoom_size_target.is_some() {
             return;
         }
         // 最大化时长宽比由屏幕决定，必然有黑边 —— 先取消最大化
@@ -688,27 +774,29 @@ impl FramePlayerApp {
                 let drag = ui.interact(bar, egui::Id::new("title_drag"), egui::Sense::click_and_drag());
                 drag.surrender_focus(); // 标题栏拖拽区不持有键盘焦点
                 // 手动移动窗口（不走系统移动循环），避免拖到屏幕边缘触发 Win11 自动吸附。
+                // 窗口位置 = 实时光标位置 − 起拖偏移：与光标 1:1、数位板也能拖。
                 let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                 if drag.double_clicked() {
-                    self.drag_win_pos = None;
+                    self.drag_offset = None;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 } else if maximized {
-                    self.drag_win_pos = None; // 最大化时不手动移动
+                    self.drag_offset = None; // 最大化时不手动移动
                 } else {
                     if drag.drag_started_by(egui::PointerButton::Primary) {
-                        self.drag_win_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+                        let win = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+                        self.drag_offset = match (cursor_screen_points(&ctx), win) {
+                            (Some(cur), Some(win)) => Some(cur - win),
+                            _ => None,
+                        };
                     }
                     if drag.dragged_by(egui::PointerButton::Primary) {
-                        if let Some(pos) = self.drag_win_pos.as_mut() {
-                            // 用原始鼠标位移(物理像素)累积到锚点，除以缩放转逻辑点；
-                            // 不每帧回读 outer_rect（OuterPosition 异步生效会滞后导致抖动）。
-                            *pos += drag.drag_motion() / ctx.pixels_per_point();
-                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(*pos));
+                        if let (Some(off), Some(cur)) = (self.drag_offset, cursor_screen_points(&ctx)) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(cur - off));
                             ctx.request_repaint();
                         }
                     }
                     if drag.drag_stopped() {
-                        self.drag_win_pos = None;
+                        self.drag_offset = None;
                     }
                 }
 
@@ -1274,22 +1362,148 @@ impl eframe::App for FramePlayerApp {
                 egui::Id::new("immersive_move"),
                 egui::Sense::click_and_drag(),
             );
-            // 手动移动窗口，避免触发 Win11 自动吸附（与标题栏同一套逻辑）。
+            // 手动移动窗口，避免触发 Win11 自动吸附（与标题栏同一套逻辑：跟随真实光标）。
             if resp.drag_started_by(egui::PointerButton::Primary) {
-                self.drag_win_pos = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+                let win = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+                self.drag_offset = match (cursor_screen_points(&ctx), win) {
+                    (Some(cur), Some(win)) => Some(cur - win),
+                    _ => None,
+                };
             }
             if resp.dragged_by(egui::PointerButton::Primary) {
-                if let Some(pos) = self.drag_win_pos.as_mut() {
-                    *pos += resp.drag_motion() / ctx.pixels_per_point();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(*pos));
+                if let (Some(off), Some(cur)) = (self.drag_offset, cursor_screen_points(&ctx)) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(cur - off));
                     ctx.request_repaint();
                 }
             }
             if resp.drag_stopped() {
-                self.drag_win_pos = None;
+                self.drag_offset = None;
             }
             if resp.double_clicked() {
                 self.set_immersive(&ctx, false); // 双击退出沉浸
+            }
+
+            // 指针悬停在窗口上：显示悬浮图钉（置顶开关）＋ 滚轮调节
+            let hovered = ctx.input(|i| i.pointer.latest_pos().is_some());
+            if hovered {
+                // 悬浮图钉（右上角）
+                egui::Area::new("immersive_pin".into())
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+                    .movable(false)
+                    .show(&ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(col::bar())
+                            .stroke(egui::Stroke::new(1.0, col::BORDER))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(3, 3))
+                            .show(ui, |ui| {
+                                let pin_color = if self.always_on_top {
+                                    col::ACCENT
+                                } else {
+                                    col::TEXT_DIM
+                                };
+                                let pin_hover = if self.always_on_top {
+                                    "窗口置顶：开"
+                                } else {
+                                    "窗口置顶：关"
+                                };
+                                if icon_button(ui, ico::PIN, pin_hover, pin_color).clicked() {
+                                    let on = !self.always_on_top;
+                                    self.set_always_on_top(&ctx, on);
+                                }
+                            });
+                    });
+
+                // Ctrl+滚轮 = 调整窗口透明度。egui 把「Ctrl+滚轮」归入 zoom_delta
+                // （此时 smooth_scroll_delta 为 0），所以两路互不干扰、无需查修饰键。
+                let zoom = ctx.input(|i| i.zoom_delta());
+                if zoom != 1.0 {
+                    self.set_window_opacity(self.opacity + zoom.ln() * 0.5);
+                }
+                // 滚轮 = 以窗口中心为锚等比缩放窗口（一格 ≈ 8%）。
+                // 读原始滚轮事件而非 smooth_scroll_delta：平滑量把一格拆成多帧、
+                // 每帧一次 InnerSize（每次都重建交换链）→ 一顿一顿。原始事件一格只发一次。
+                let raw_scroll: f32 = ctx.input(|i| {
+                    i.raw
+                        .events
+                        .iter()
+                        .map(|e| match e {
+                            egui::Event::MouseWheel {
+                                unit,
+                                delta,
+                                modifiers,
+                                ..
+                            } if !modifiers.ctrl => match unit {
+                                egui::MouseWheelUnit::Point => delta.y,
+                                egui::MouseWheelUnit::Line => delta.y * 50.0,
+                                egui::MouseWheelUnit::Page => delta.y * 400.0,
+                            },
+                            _ => 0.0,
+                        })
+                        .sum()
+                });
+                if raw_scroll != 0.0 {
+                    if let Some(rect) = ctx.input(|i| i.viewport().outer_rect) {
+                        // 基数用在途目标（若有）：InnerSize 异步生效，实际尺寸滞后一两帧，
+                        // 连续滚动若以它为基数会回退重算，和未生效的命令打架。
+                        let size = self
+                            .zoom_size_target
+                            .unwrap_or_else(|| ctx.content_rect().size());
+                        let pos = self.zoom_pos_target.unwrap_or(rect.min);
+                        let factor = (raw_scroll * 0.0015).exp();
+                        let mon = ctx
+                            .input(|i| i.viewport().monitor_size)
+                            .unwrap_or(egui::vec2(3840.0, 2160.0));
+                        // 下限：宽 ≥320；上限：宽高都不超过屏幕 98%（竖屏视频受高度约束）
+                        let lo = 320.0 / size.x;
+                        let hi = (mon.x * 0.98 / size.x).min(mon.y * 0.98 / size.y).max(lo);
+                        let scale = factor.clamp(lo, hi);
+                        let new_size = size * scale;
+                        let new_pos = pos + (size - new_size) * 0.5;
+                        // 只更新目标，由下方的动画块小步推进（避免 8% 突变闪烁）
+                        self.zoom_size_target = Some(new_size);
+                        self.zoom_pos_target = Some(new_pos);
+                        self.zoom_last_t = ctx.input(|i| i.time);
+                        self.prev_size = Some(new_size); // 同步比例锁定基准，避免回弹
+                        ctx.request_repaint();
+                    }
+                }
+            }
+
+            // 滚轮缩放动画：每帧向目标推进 40%，小步多帧（与系统边缘拖拽缩放一样的
+            // 节奏），避免一次 8% 的尺寸突变在合成器上露出旧帧拉伸的闪烁。
+            if let (Some(tgt_s), Some(tgt_p)) = (self.zoom_size_target, self.zoom_pos_target) {
+                let now = ctx.input(|i| i.time);
+                let (cur_p, cur_s) = match self.zoom_applied {
+                    Some(v) => v,
+                    None => {
+                        let p = ctx.input(|i| i.viewport().outer_rect).map(|r| r.min);
+                        match p {
+                            Some(p) => (p, ctx.content_rect().size()),
+                            None => (tgt_p, tgt_s), // 拿不到窗口位置：直接视为已到位
+                        }
+                    }
+                };
+                let remain = tgt_s - cur_s;
+                if remain.abs().max_elem() > 1.0 {
+                    let mut new_s = cur_s + remain * 0.4;
+                    let mut new_p = cur_p + (tgt_p - cur_p) * 0.4;
+                    if (tgt_s - new_s).abs().max_elem() <= 1.0 {
+                        new_s = tgt_s;
+                        new_p = tgt_p;
+                    }
+                    self.move_resize_atomic(&ctx, new_p, new_s);
+                    self.zoom_applied = Some((new_p, new_s));
+                    ctx.request_repaint();
+                } else if now - self.zoom_last_t > 0.3 {
+                    // 到位且静默：清除在途状态，恢复 enforce_immersive_aspect 的纠正
+                    self.zoom_size_target = None;
+                    self.zoom_pos_target = None;
+                    self.zoom_applied = None;
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(320));
+                }
             }
 
             // 沉浸模式角标提示：停留 1s 后 1s 渐隐消失
@@ -1514,6 +1728,17 @@ fn window_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
         _ => None,
     }
+}
+
+/// 当前鼠标光标的屏幕位置（逻辑点，与 viewport().outer_rect 同一坐标空间）。
+/// 拖窗用绝对光标位置：不受系统指针加速影响、鼠标/数位板/触控笔通吃。
+fn cursor_screen_points(ctx: &egui::Context) -> Option<egui::Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p).ok()? };
+    let ppp = ctx.pixels_per_point();
+    Some(egui::pos2(p.x as f32 / ppp, p.y as f32 / ppp))
 }
 
 /// 关闭 Windows 11 DWM 的窗口圆角（DWMWCP_DONOTROUND）。无边框窗口默认仍被系统圆角，

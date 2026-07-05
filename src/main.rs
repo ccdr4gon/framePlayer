@@ -35,6 +35,13 @@ fn init_logging() {
 fn main() -> eframe::Result<()> {
     init_logging();
 
+    // 强制 wgpu 走 DX12：Vulkan 交换链在窗口连续改尺寸时重建会闪黑/闪旧帧，
+    // DXGI(DX12) 对窗口缩放的呈现平滑得多。用户可用已存在的 WGPU_BACKEND 覆盖。
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        // SAFETY: 进程刚启动、尚未创建任何其它线程，设置环境变量是安全的。
+        unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+    }
+
     // 无界面自检： frame_player --selftest <path>
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--selftest") {
