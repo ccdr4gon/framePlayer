@@ -1408,7 +1408,8 @@ impl eframe::App for FramePlayerApp {
                                 } else {
                                     "窗口置顶：关"
                                 };
-                                if icon_button(ui, ico::PIN, pin_hover, pin_color).clicked() {
+                                if centered_icon_button(ui, ico::PIN, pin_color, pin_hover).clicked()
+                                {
                                     let on = !self.always_on_top;
                                     self.set_always_on_top(&ctx, on);
                                 }
@@ -1561,6 +1562,22 @@ impl eframe::App for FramePlayerApp {
 }
 
 // ——————————————————————— 小部件辅助 ———————————————————————
+
+/// 在固定方框内按字形「实际墨迹(mesh_bounds)」视觉居中，而不是按排版盒(含字体上下
+/// 留白)居中——后者会让图标看着偏一点。用于带边框的悬浮图钉这种居中要求高的场合。
+fn centered_icon_button(ui: &mut egui::Ui, ch: char, color: egui::Color32, hover: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::click());
+    resp.surrender_focus();
+    let p = ui.painter();
+    let galley = p.layout_no_wrap(
+        ch.to_string(),
+        egui::FontId::new(16.0, egui::FontFamily::Name("icons".into())),
+        color,
+    );
+    let ink = galley.mesh_bounds;
+    p.galley(rect.center() - ink.center().to_vec2(), galley, color);
+    resp.on_hover_text(hover)
+}
 
 fn icon_button(ui: &mut egui::Ui, ch: char, hover: &str, color: egui::Color32) -> egui::Response {
     let resp = ui.add(
