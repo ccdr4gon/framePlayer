@@ -6,8 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 让转码进程以「低于正常」优先级运行，给键盘钩子等让出 CPU。
@@ -113,16 +113,20 @@ pub fn existing_proxy(source: &Path) -> Option<PathBuf> {
 /// 把代理缓存目录压到 `max_mb` MiB 以内：按修改时间从旧到新删，直到达标。
 /// 启动时、每次转码成功后、以及在设置里调小上限时各调用一次。0 = 不限制。
 /// 只在 UI 线程调用——绝不能在键盘钩子回调里碰文件系统。
-pub fn evict_cache(max_mb: u64) {
+pub fn evict_cache(max_mb: u64, keep: Option<&Path>) {
+    let Some(dir) = cache_dir() else { return };
+    evict_cache_in(&dir, max_mb, keep);
+}
+
+fn evict_cache_in(dir: &Path, max_mb: u64, keep: Option<&Path>) {
     if max_mb == 0 {
         return;
     }
-    let Some(dir) = cache_dir() else { return };
     let max_bytes = max_mb.saturating_mul(1024 * 1024);
 
     let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let mut total: u64 = 0;
-    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("mp4") {
@@ -138,6 +142,9 @@ pub fn evict_cache(max_mb: u64) {
             continue;
         }
         let Ok(meta) = e.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
         let size = meta.len();
         let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         total = total.saturating_add(size);
@@ -150,6 +157,10 @@ pub fn evict_cache(max_mb: u64) {
     for (path, size, _) in entries {
         if total <= max_bytes {
             break;
+        }
+        // 正在使用或准备打开的代理允许暂时超出上限，不能在交给解码线程前删掉。
+        if keep == Some(path.as_path()) {
+            continue;
         }
         match std::fs::remove_file(&path) {
             Ok(()) => {
@@ -169,22 +180,39 @@ pub fn spawn_transcode(
     total_frames: u64,
     ctx: egui::Context,
     cancel: Arc<AtomicBool>,
-) -> Receiver<ProxyMsg> {
+) -> (Receiver<ProxyMsg>, std::thread::JoinHandle<()>) {
     let (tx, rx) = crossbeam_channel::unbounded();
-    std::thread::Builder::new()
+    let worker = std::thread::Builder::new()
         .name("proxy".into())
         .spawn(move || run(&tx, &ffmpeg, &source, &dest, total_frames, &ctx, &cancel))
         .expect("spawn proxy thread");
-    rx
+    (rx, worker)
 }
 
-fn aborted(cancel: &AtomicBool, child: &mut Child, tmp: &Path) -> bool {
-    if cancel.load(Ordering::Relaxed) {
-        let _ = child.kill();
-        let _ = std::fs::remove_file(tmp);
-        true
-    } else {
-        false
+static TRANSCODE_ID: AtomicU64 = AtomicU64::new(0);
+
+fn temporary_path(dest: &Path) -> PathBuf {
+    let id = TRANSCODE_ID.fetch_add(1, Ordering::Relaxed);
+    dest.with_extension(format!("{}-{id}.part.mp4", std::process::id()))
+}
+
+/// 始终等待子进程退出后再清理，Windows 上仍在写入的文件无法删除。
+fn wait_for_transcode(child: &mut Child, cancel: &AtomicBool) -> std::io::Result<Option<ExitStatus>> {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            child.wait()?;
+            return Ok(None);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        }
     }
 }
 
@@ -197,10 +225,14 @@ fn run(
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
     if let Some(parent) = dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let tmp = dest.with_extension("part.mp4");
+    // 每个进程、每次任务各用一份临时文件，避免多窗口转码互相覆盖/删除。
+    let tmp = temporary_path(dest);
 
     // 只用一半核心，给键盘钩子/UI 留出 CPU，避免转码期间全局快捷键被饿死。
     let cores = std::thread::available_parallelism()
@@ -229,6 +261,7 @@ fn run(
         .args(["-progress", "pipe:1", "-nostats"])
         .arg(&tmp)
         .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -241,54 +274,34 @@ fn run(
         }
     };
 
-    // 解析 -progress 的 frame=N 行换算百分比
-    if let Some(stdout) = child.stdout.take() {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if aborted(cancel, &mut child, &tmp) {
-                return;
-            }
-            if let Some(v) = line.strip_prefix("frame=") {
-                if let Ok(f) = v.trim().parse::<u64>() {
-                    let p = if total_frames > 0 {
-                        (f as f32 / total_frames as f32).clamp(0.0, 0.999)
-                    } else {
-                        0.0
-                    };
-                    let _ = tx.send(ProxyMsg::Progress(p));
-                    ctx.request_repaint();
-                }
-            }
-        }
-    }
-    if aborted(cancel, &mut child, &tmp) {
+    let (status, stderr_tail) = monitor_transcode(&mut child, tx, total_frames, ctx, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_file(&tmp);
         return;
     }
 
-    let status = child.wait();
-    let stderr = child
-        .stderr
-        .take()
-        .map(|mut s| {
-            let mut buf = String::new();
-            use std::io::Read;
-            let _ = s.read_to_string(&mut buf);
-            buf
-        })
-        .unwrap_or_default();
-
     match status {
-        Ok(s) if s.success() => match std::fs::rename(&tmp, dest) {
+        Ok(None) => {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        Ok(Some(s)) if s.success() => match std::fs::rename(&tmp, dest) {
             Ok(()) => {
                 let _ = tx.send(ProxyMsg::Done(dest.to_path_buf()));
             }
             Err(e) => {
-                let _ = tx.send(ProxyMsg::Failed(format!("重命名代理失败: {e}")));
+                let _ = std::fs::remove_file(&tmp);
+                // 另一个窗口可能已经发布了同一份代理；只会看到完整的最终文件。
+                if std::fs::metadata(dest).is_ok_and(|m| m.is_file() && m.len() > 0) {
+                    let _ = tx.send(ProxyMsg::Done(dest.to_path_buf()));
+                } else {
+                    let _ = tx.send(ProxyMsg::Failed(format!("重命名代理失败: {e}")));
+                }
             }
         },
-        Ok(s) => {
+        Ok(Some(s)) => {
             let _ = std::fs::remove_file(&tmp);
-            let tail: String = stderr.lines().rev().take(2).collect::<Vec<_>>().join(" | ");
-            let _ = tx.send(ProxyMsg::Failed(format!("ffmpeg 退出码 {s}: {tail}")));
+            let _ = tx.send(ProxyMsg::Failed(format!("ffmpeg 退出码 {s}: {stderr_tail}")));
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -296,4 +309,194 @@ fn run(
         }
     }
     ctx.request_repaint();
+}
+
+fn monitor_transcode(
+    child: &mut Child,
+    tx: &Sender<ProxyMsg>,
+    total_frames: u64,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> (std::io::Result<Option<ExitStatus>>, String) {
+    // 两路输出必须同时读取：stderr 管道写满时 FFmpeg 会阻塞，也就不会再输出进度。
+    // 取消检测独立于输出，避免卡在读取下一行、迟迟无法停止转码。
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            if let Some(stdout) = stdout {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    if let Some(v) = line.strip_prefix("frame=")
+                        && let Ok(f) = v.trim().parse::<u64>()
+                    {
+                        let p = if total_frames > 0 {
+                            (f as f32 / total_frames as f32).clamp(0.0, 0.999)
+                        } else {
+                            0.0
+                        };
+                        let _ = tx.send(ProxyMsg::Progress(p));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        });
+        let errors = scope.spawn(|| {
+            let mut tail = std::collections::VecDeque::new();
+            if let Some(stderr) = stderr {
+                // FFmpeg 的诊断在 Windows 上不一定是 UTF-8；替换无效字节后继续排空管道。
+                for line in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
+                    if tail.len() == 2 {
+                        tail.pop_front();
+                    }
+                    tail.push_back(String::from_utf8_lossy(&line).trim().to_owned());
+                }
+            }
+            tail.into_iter().collect::<Vec<_>>().join(" | ")
+        });
+        let status = wait_for_transcode(child, cancel);
+        (status, errors.join().unwrap_or_default())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestDir, ffmpeg, make_video};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cache_eviction_keeps_the_active_proxy_and_partial_files() {
+        let dir = TestDir::new();
+        let old = dir.0.join("old.mp4");
+        let active = dir.0.join("active.mp4");
+        let partial = temporary_path(&active);
+        for path in [&old, &active, &partial] {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(2 * 1024 * 1024)
+                .unwrap();
+        }
+        evict_cache_in(&dir.0, 1, Some(&active));
+        assert!(!old.exists());
+        assert!(active.exists());
+        assert!(partial.exists());
+        evict_cache_in(&dir.0, 1, None);
+        assert!(!active.exists());
+        assert!(partial.exists());
+    }
+
+    #[test]
+    fn simultaneous_transcodes_publish_a_complete_proxy() {
+        let dir = TestDir::new();
+        let source = dir.0.join("source.mp4");
+        let dest = dir.0.join("proxy.mp4");
+        make_video(&source, "libx264");
+        let ffmpeg = ffmpeg();
+        let ctx = egui::Context::default();
+        let cancel = AtomicBool::new(false);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| run(&tx, &ffmpeg, &source, &dest, 48, &ctx, &cancel));
+            }
+        });
+        let mut completed = 0;
+        for msg in rx.try_iter() {
+            match msg {
+                ProxyMsg::Done(path) => {
+                    assert_eq!(path, dest);
+                    completed += 1;
+                }
+                ProxyMsg::Failed(e) => panic!("{e}"),
+                ProxyMsg::Progress(_) => {}
+            }
+        }
+        assert_eq!(completed, 2);
+        assert_eq!(
+            std::fs::read_dir(&dir.0).unwrap().count(),
+            2,
+            "不应残留临时文件"
+        );
+        let report = crate::decode::selftest(&dest).unwrap();
+        assert!(
+            report.contains("total=48") && report.contains("keyframes=48"),
+            "{report}"
+        );
+    }
+
+    // 用测试程序自身模拟 FFmpeg 输出；仅由下面的测试作为子进程启动。
+    #[test]
+    #[ignore = "由转码进程管理测试显式启动"]
+    fn subprocess_output_fixture() {
+        match std::env::var("FRAME_PLAYER_TEST_CHILD_MODE")
+            .unwrap()
+            .as_str()
+        {
+            "flood" => {
+                // 超过 Windows 管道容量，并包含非 UTF-8 诊断。
+                std::io::stderr()
+                    .write_all(&vec![b'x'; 256 * 1024])
+                    .unwrap();
+                std::io::stderr()
+                    .write_all(b"\n\xff\nlast error\n")
+                    .unwrap();
+                std::io::stdout().write_all(b"frame=48\n").unwrap();
+            }
+            "silent" => std::thread::sleep(Duration::from_secs(10)),
+            _ => panic!("unknown fixture mode"),
+        }
+    }
+
+    #[test]
+    fn transcode_drains_stderr_and_can_cancel_without_progress() {
+        for mode in ["flood", "silent"] {
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "proxy::tests::subprocess_output_fixture",
+                    "--nocapture",
+                ])
+                .env("FRAME_PLAYER_TEST_CHILD_MODE", mode)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .unwrap();
+            let cancel = AtomicBool::new(false);
+            let ctx = egui::Context::default();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+            let start = Instant::now();
+            let (status, tail) = std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let timeout = if mode == "silent" {
+                        Duration::from_millis(200)
+                    } else {
+                        Duration::from_secs(5)
+                    };
+                    if done_rx.recv_timeout(timeout).is_err() {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                });
+                let result = monitor_transcode(&mut child, &tx, 48, &ctx, &cancel);
+                let _ = done_tx.send(());
+                result
+            });
+            if mode == "flood" {
+                assert!(status.unwrap().is_some_and(|s| s.success()), "{tail}");
+                assert!(tail.contains("last error"));
+                assert!(
+                    rx.try_iter()
+                        .any(|msg| matches!(msg, ProxyMsg::Progress(p) if p > 0.9))
+                );
+            } else {
+                assert!(status.unwrap().is_none());
+                assert!(start.elapsed() < Duration::from_secs(3));
+            }
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
 }

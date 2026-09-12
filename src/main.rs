@@ -11,6 +11,8 @@ mod decode;
 mod input;
 mod msg;
 mod proxy;
+#[cfg(test)]
+mod test_support;
 
 use eframe::egui;
 

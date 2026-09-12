@@ -37,6 +37,12 @@
 2. `./build.ps1 build --release`（该脚本会激活 vcvars64 并把 FFmpeg 的 DLL + ffmpeg.exe 复制到 `target/release` 旁）。
 3. 运行 `target/release/frame_player.exe`。
 
+## 验证
+
+运行 `./build.ps1 test`。测试会用开发包中的 `ffmpeg.exe` 临时生成小视频，校验 H.264 / H.265 / AV1 的随机逐帧结果与 FFmpeg 顺序解码的像素一致，并覆盖续播、文件切换、代理缓存和转码取消。测试文件放在 `target/test-artifacts`，结束后自动删除。标为 ignored 的子进程辅助测试由转码测试自动启动，无需单独运行。
+
+缓存清理会保留当前正在使用或准备打开的代理；单个代理大于缓存上限时允许暂时超限，避免切换失败。
+
 ## 技术栈
 
 `eframe`/`egui` 0.35（wgpu）UI · `ffmpeg-next` + FFmpeg 7.1.1 解码（GOP 缓存 + 解码游标，多线程软解，逐帧准确）· `RegisterHotKey` 全局热键 · `crossbeam-channel` 线程通信。

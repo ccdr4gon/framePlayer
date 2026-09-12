@@ -14,72 +14,87 @@ use std::sync::Arc;
 const CACHE_BUDGET: usize = 1024 * 1024 * 1024; // 1 GiB
 
 pub struct DecoderHandle {
-    pub to: Sender<ToDecoder>,
-    pub from: Receiver<FromDecoder>,
+    to: Sender<(u64, ToDecoder)>,
+    from: Receiver<(u64, FromDecoder)>,
+    generation: u64,
+}
+
+impl DecoderHandle {
+    pub(crate) fn new(to: Sender<(u64, ToDecoder)>, from: Receiver<(u64, FromDecoder)>) -> Self {
+        Self { to, from, generation: 0 }
+    }
+
+    pub fn open(&mut self, path: std::path::PathBuf) -> Result<(), String> {
+        self.generation += 1;
+        self.request(ToDecoder::Open(path))
+    }
+
+    pub fn request(&self, msg: ToDecoder) -> Result<(), String> {
+        self.to.send((self.generation, msg)).map_err(|_| "解码线程已退出".into())
+    }
+
+    pub fn try_recv(&self) -> Result<FromDecoder, crossbeam_channel::TryRecvError> {
+        loop {
+            let (generation, msg) = self.from.try_recv()?;
+            if generation == self.generation {
+                return Ok(msg);
+            }
+        }
+    }
 }
 
 pub fn spawn(ctx: egui::Context) -> DecoderHandle {
-    let (to_tx, to_rx) = crossbeam_channel::unbounded::<ToDecoder>();
-    let (from_tx, from_rx) = crossbeam_channel::unbounded::<FromDecoder>();
+    let (to_tx, to_rx) = crossbeam_channel::unbounded();
+    let (from_tx, from_rx) = crossbeam_channel::unbounded();
 
     std::thread::Builder::new()
         .name("decoder".into())
         .spawn(move || {
-            if let Err(e) = ff::init() {
-                let _ = from_tx.send(FromDecoder::Error(format!("ffmpeg init 失败: {e}")));
-            }
-            let mut state: Option<VideoState> = None;
+            let mut state: Option<(u64, VideoState)> = None;
 
-            while let Ok(msg) = to_rx.recv() {
+            while let Ok((generation, msg)) = to_rx.recv() {
+                let send = |msg| { let _ = from_tx.send((generation, msg)); };
                 match msg {
                     ToDecoder::Open(path) => {
+                        // 打开失败后不能继续从上一个视频取帧。
+                        state = None;
                         match VideoState::open(&path) {
-                            Ok(mut st) => {
-                                let _ = from_tx.send(FromDecoder::Opened {
+                            Ok(st) => {
+                                send(FromDecoder::Opened {
                                     total_frames: st.frame_pts.len() as u64,
                                     fps: st.fps,
                                     width: st.width,
                                     height: st.height,
                                     keyframes: st.keyframe_indices.len() as u64,
                                 });
-                                match st.frame(0) {
-                                    Ok(f) => {
-                                        let _ = from_tx.send(FromDecoder::Frame(f));
-                                    }
-                                    Err(e) => {
-                                        let _ = from_tx
-                                            .send(FromDecoder::Error(format!("解码首帧失败: {e}")));
-                                    }
-                                }
-                                state = Some(st);
+                                // 首张画面由 UI 请求：可以直接显示续播帧，且只有一个在途请求。
+                                state = Some((generation, st));
                             }
                             Err(e) => {
-                                let _ = from_tx.send(FromDecoder::Error(format!("打开失败: {e}")));
+                                send(FromDecoder::Error(format!("打开失败: {e}")));
                             }
                         }
                     }
                     ToDecoder::GetFrame(n) => {
-                        if let Some(st) = state.as_mut() {
+                        if let Some((_, st)) = state.as_mut().filter(|(g, _)| *g == generation) {
                             match st.frame(n) {
                                 Ok(f) => {
-                                    let _ = from_tx.send(FromDecoder::Frame(f));
+                                    send(FromDecoder::Frame(f));
                                 }
                                 Err(e) => {
-                                    let _ = from_tx
-                                        .send(FromDecoder::Error(format!("解码第 {n} 帧失败: {e}")));
+                                    send(FromDecoder::Error(format!("解码第 {n} 帧失败: {e}")));
                                 }
                             }
                         }
                     }
                     ToDecoder::Preview(n) => {
-                        if let Some(st) = state.as_mut() {
+                        if let Some((_, st)) = state.as_mut().filter(|(g, _)| *g == generation) {
                             match st.keyframe(n) {
                                 Ok(f) => {
-                                    let _ = from_tx.send(FromDecoder::Frame(f));
+                                    send(FromDecoder::Frame(f));
                                 }
                                 Err(e) => {
-                                    let _ = from_tx
-                                        .send(FromDecoder::Error(format!("预览第 {n} 帧失败: {e}")));
+                                    send(FromDecoder::Error(format!("预览第 {n} 帧失败: {e}")));
                                 }
                             }
                         }
@@ -90,7 +105,7 @@ pub fn spawn(ctx: egui::Context) -> DecoderHandle {
         })
         .expect("spawn decoder thread");
 
-    DecoderHandle { to: to_tx, from: from_rx }
+    DecoderHandle::new(to_tx, from_rx)
 }
 
 /// 缓存解码后的 YUV 帧（引用计数，零拷贝）。显示时才转 RGBA，避免把途经帧都做色彩转换。
@@ -182,6 +197,7 @@ struct VideoState {
 
 impl VideoState {
     fn open(path: &Path) -> Result<Self, ff::Error> {
+        ff::init()?;
         let mut ictx = ff::format::input(&path)?;
 
         let (stream_index, time_base, fps, decoder) = {
@@ -224,6 +240,9 @@ impl VideoState {
         }
         pairs.sort_by_key(|&(p, _)| p);
         pairs.dedup_by_key(|&mut (p, _)| p);
+        if pairs.is_empty() {
+            return Err(ff::Error::InvalidData);
+        }
 
         let frame_pts: Vec<i64> = pairs.iter().map(|&(p, _)| p).collect();
         let mut keyframe_indices: Vec<usize> = pairs
@@ -485,4 +504,77 @@ fn rescale_to_us(pts: i64, tb: ff::Rational) -> i64 {
         return pts;
     }
     ((pts as i128 * num * 1_000_000) / den) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestDir, ffmpeg_output, make_video};
+
+    #[test]
+    fn random_access_pixels_match_sequential_ffmpeg_decode() {
+        let dir = TestDir::new();
+        for codec in ["libx264", "libx265", "libaom-av1"] {
+            let path = dir.0.join(format!("{codec}.mp4"));
+            make_video(&path, codec);
+            let reference = ffmpeg_output(&[
+                "-i",
+                path.to_str().unwrap(),
+                "-an",
+                "-fps_mode",
+                "passthrough",
+                "-sws_flags",
+                "bilinear",
+                "-pix_fmt",
+                "rgba",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ])
+            .stdout;
+            let mut video = VideoState::open(&path).unwrap();
+            let frame_len = 96 * 64 * 4;
+            assert_eq!(
+                video.frame_pts.len(),
+                reference.len() / frame_len,
+                "{codec}"
+            );
+            for target in [0, 1, 11, 12, 13, 47, 23, 24, 25, 2] {
+                let frame = video
+                    .frame(target)
+                    .unwrap_or_else(|e| panic!("{codec} frame {target}: {e}"));
+                let start = target as usize * frame_len;
+                assert!(
+                    frame.pixels == reference[start..start + frame_len],
+                    "{codec} frame {target} differs from sequential decode"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_open_does_not_reuse_the_previous_video() {
+        let dir = TestDir::new();
+        let path = dir.0.join("source.mp4");
+        make_video(&path, "libx264");
+        let mut decoder = spawn(egui::Context::default());
+        let timeout = std::time::Duration::from_secs(10);
+        decoder.open(path).unwrap();
+        assert!(matches!(
+            decoder.from.recv_timeout(timeout),
+            Ok((_, FromDecoder::Opened { .. }))
+        ));
+        decoder.open(dir.0.join("missing.mp4")).unwrap();
+        assert!(matches!(
+            decoder.from.recv_timeout(timeout),
+            Ok((_, FromDecoder::Error(_)))
+        ));
+        decoder.request(ToDecoder::GetFrame(0)).unwrap();
+        // 再发一次失败的打开作为队列末尾标记；之前的取帧不能返回旧画面。
+        decoder.open(dir.0.join("also-missing.mp4")).unwrap();
+        assert!(matches!(
+            decoder.from.recv_timeout(timeout),
+            Ok((_, FromDecoder::Error(_)))
+        ));
+    }
 }

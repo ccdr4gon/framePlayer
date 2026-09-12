@@ -76,6 +76,10 @@ pub struct FramePlayerApp {
     capturing: Option<Action>,
 
     file: Option<PathBuf>,
+    /// 实际交给解码线程的路径（可能是代理），缓存清理时保留它。
+    decoder_path: Option<PathBuf>,
+    /// 从发出打开请求到第一张画面到达，期间不保存续播位置。
+    opening: bool,
     current_frame: u64,
     total_frames: u64,
     fps: f64,
@@ -114,6 +118,7 @@ pub struct FramePlayerApp {
     proxy_progress: Option<f32>,
     /// 取消正在进行的代理转码（打开新文件时置位）
     proxy_cancel: Option<Arc<AtomicBool>>,
+    proxy_worker: Option<std::thread::JoinHandle<()>>,
     /// 切换到代理后要恢复到的帧
     restore_frame: Option<u64>,
     /// 打开新文件时待恢复的「上次播放到的帧」（续播）
@@ -180,13 +185,34 @@ impl FramePlayerApp {
             let _ = std::fs::write(&p, std::process::id().to_string());
         }
 
-        let mut app = Self {
+        let mut app = Self::with_services(decoder, hook_rx, config, hwnd);
+        // 命令行打开：走 open_path 以便自动用/生成代理
+        if let Some(arg) = std::env::args().skip(1).find(|a| !a.starts_with("--")) {
+            let p = PathBuf::from(&arg);
+            if p.is_file() {
+                app.open_path(p);
+            }
+        }
+        // 启动时按上限压一次代理缓存（清理历史/孤立的代理）
+        proxy::evict_cache(app.proxy_cache_max_mb, app.decoder_path.as_deref());
+        app
+    }
+
+    fn with_services(
+        decoder: DecoderHandle,
+        hook_rx: crossbeam_channel::Receiver<HookMsg>,
+        config: Config,
+        hwnd: Option<isize>,
+    ) -> Self {
+        Self {
             decoder,
             hook_rx,
             tex: None,
             bindings: config.bindings,
             capturing: None,
             file: None,
+            decoder_path: None,
+            opening: false,
             current_frame: 0,
             total_frames: 0,
             fps: 0.0,
@@ -212,6 +238,7 @@ impl FramePlayerApp {
             proxy_rx: None,
             proxy_progress: None,
             proxy_cancel: None,
+            proxy_worker: None,
             restore_frame: None,
             pending_resume: None,
             resume_saved_frame: 0,
@@ -230,17 +257,7 @@ impl FramePlayerApp {
             prev_focused: false,
             last_active_poll: 0.0,
             repaint_until: 0.0,
-        };
-        // 命令行打开：走 open_path 以便自动用/生成代理
-        if let Some(arg) = std::env::args().skip(1).find(|a| !a.starts_with("--")) {
-            let p = PathBuf::from(&arg);
-            if p.is_file() {
-                app.open_path(p);
-            }
         }
-        // 启动时按上限压一次代理缓存（清理历史/孤立的代理）
-        proxy::evict_cache(app.proxy_cache_max_mb);
-        app
     }
 
     /// 设置整窗不透明度（0.2..=1.0）。用分层窗口的 LWA_ALPHA：DWM 合成期生效，
@@ -364,7 +381,7 @@ impl FramePlayerApp {
     fn open_path(&mut self, source: PathBuf) {
         // 切走前先记下上一个文件的播放位置
         if let Some(old) = self.source_file.clone() {
-            if self.total_frames > 0 {
+            if self.total_frames > 0 && !self.opening {
                 proxy::save_resume(&old, self.current_frame);
             }
         }
@@ -386,7 +403,31 @@ impl FramePlayerApp {
         } else {
             format!("正在打开 {}…", source.display())
         };
-        let _ = self.decoder.to.send(ToDecoder::Open(to_open));
+        self.open_decoder(to_open);
+    }
+
+    fn open_decoder(&mut self, path: PathBuf) {
+        self.decoder_path = Some(path.clone());
+        self.opening = true;
+        self.tex = None;
+        self.total_frames = 0;
+        self.current_frame = 0;
+        self.resume_saved_frame = self.restore_frame.or(self.pending_resume).unwrap_or(0);
+        self.fps = 0.0;
+        self.vid_w = 0;
+        self.vid_h = 0;
+        self.playing = false;
+        self.holding = None;
+        self.holding_vk = None;
+        self.pending = true;
+        self.pending_preview = false;
+        self.pending_req = None;
+        self.current_is_preview = false;
+        if let Err(e) = self.decoder.open(path) {
+            self.opening = false;
+            self.pending = false;
+            self.status = e;
+        }
     }
 
     /// 为当前源生成全 I 帧代理（后台转码，进度见设置面板）。
@@ -411,20 +452,26 @@ impl FramePlayerApp {
         let cancel = Arc::new(AtomicBool::new(false));
         self.proxy_cancel = Some(cancel.clone());
         self.proxy_progress = Some(0.0);
-        self.proxy_rx = Some(proxy::spawn_transcode(
+        let (rx, worker) = proxy::spawn_transcode(
             ffmpeg,
             src,
             dest,
             self.total_frames,
             ctx.clone(),
             cancel,
-        ));
+        );
+        self.proxy_rx = Some(rx);
+        self.proxy_worker = Some(worker);
     }
 
     /// 中止正在进行的代理转码。
     fn cancel_proxy(&mut self) {
         if let Some(c) = self.proxy_cancel.take() {
             c.store(true, Ordering::Relaxed);
+        }
+        // 等待 FFmpeg 退出和临时文件清理；否则关闭应用时后台线程来不及处理取消信号。
+        if let Some(worker) = self.proxy_worker.take() {
+            let _ = worker.join();
         }
         self.proxy_rx = None;
         self.proxy_progress = None;
@@ -446,10 +493,13 @@ impl FramePlayerApp {
                     self.proxy_cancel = None;
                     self.using_proxy = true;
                     self.status = "加速完成，已切换到代理".into();
-                    self.restore_frame = Some(self.current_frame);
-                    self.tex = None;
-                    proxy::evict_cache(self.proxy_cache_max_mb); // 新代理写入后压缩缓存
-                    let _ = self.decoder.to.send(ToDecoder::Open(path));
+                    self.restore_frame = Some(if self.opening {
+                        self.resume_saved_frame
+                    } else {
+                        self.current_frame
+                    });
+                    self.open_decoder(path);
+                    proxy::evict_cache(self.proxy_cache_max_mb, self.decoder_path.as_deref());
                 }
                 ProxyMsg::Failed(e) => {
                     self.proxy_rx = None;
@@ -482,7 +532,7 @@ impl FramePlayerApp {
             return;
         }
         // 已精确停在该帧则不重复请求；但若当前是预览画面，松手的精确请求必须发出
-        if !preview && target == self.current_frame && !self.current_is_preview {
+        if !preview && target == self.current_frame && !self.current_is_preview && self.tex.is_some() {
             return;
         }
         self.pending = true;
@@ -493,7 +543,10 @@ impl FramePlayerApp {
         } else {
             ToDecoder::GetFrame(target)
         };
-        let _ = self.decoder.to.send(msg);
+        if let Err(e) = self.decoder.request(msg) {
+            self.pending = false;
+            self.status = e;
+        }
     }
 
     /// 处理来自全局钩子的已识别动作。
@@ -576,7 +629,7 @@ impl FramePlayerApp {
     }
 
     fn drain_decoder(&mut self, ctx: &egui::Context) {
-        while let Ok(msg) = self.decoder.from.try_recv() {
+        while let Ok(msg) = self.decoder.try_recv() {
             match msg {
                 FromDecoder::Opened {
                     total_frames,
@@ -602,13 +655,10 @@ impl FramePlayerApp {
                     let seek = self
                         .restore_frame
                         .take()
-                        .or_else(|| self.pending_resume.take());
-                    if let Some(f) = seek {
-                        let f = f.min(total_frames.saturating_sub(1));
-                        self.current_frame = f; // 乐观置位，避免续播帧到达前被周期保存覆盖成 0
-                        self.request(f, false);
-                    }
-                    self.resume_saved_frame = self.current_frame; // 同步，开局不立刻回写
+                        .or(self.pending_resume.take());
+                    let f = seek.unwrap_or(0).min(total_frames.saturating_sub(1));
+                    self.request(f, false);
+                    self.resume_saved_frame = f; // 首张画面到达前不回写续播记录
                     // 按视频比例自适应窗口（消除黑边）
                     if std::mem::take(&mut self.fit_pending) {
                         self.fit_window_to_video(ctx);
@@ -620,6 +670,7 @@ impl FramePlayerApp {
                     }
                 }
                 FromDecoder::Frame(frame) => {
+                    self.opening = false;
                     self.current_frame = frame.index;
                     self.current_is_preview = self.pending_preview;
                     self.pending = false;
@@ -627,6 +678,28 @@ impl FramePlayerApp {
                 }
                 FromDecoder::Error(e) => {
                     self.pending = false;
+                    self.pending_req = None;
+                    self.playing = false;
+                    self.holding = None;
+                    self.holding_vk = None;
+                    // 缓存可能已损坏或被别的窗口清理；失败时仍可打开原文件。
+                    if self.opening && self.using_proxy
+                        && let Some(source) = self.source_file.clone()
+                    {
+                        self.restore_frame.get_or_insert(self.resume_saved_frame);
+                        self.using_proxy = false;
+                        self.status = format!("代理不可用，改用原文件：{e}");
+                        self.open_decoder(source);
+                        continue;
+                    }
+                    if self.opening {
+                        self.total_frames = 0;
+                        self.vid_w = 0;
+                        self.vid_h = 0;
+                        self.fps = 0.0;
+                        self.opening = false;
+                        self.cancel_proxy();
+                    }
                     self.status = format!("错误：{e}");
                     log::error!("{e}");
                 }
@@ -1160,11 +1233,23 @@ impl FramePlayerApp {
                         if cache_row(ui, &mut gib).changed() {
                             self.proxy_cache_max_mb = (gib * 1024.0).round() as u64;
                             self.save_config();
-                            proxy::evict_cache(self.proxy_cache_max_mb); // 调小即时生效
+                            proxy::evict_cache(self.proxy_cache_max_mb, self.decoder_path.as_deref());
                         }
                         ui.add_space(10.0);
                     });
             });
+    }
+}
+
+impl Drop for FramePlayerApp {
+    fn drop(&mut self) {
+        self.cancel_proxy();
+        // 关闭可能发生在 0.3s 的周期保存之前，补写最后显示的位置。
+        if self.total_frames > 0 && !self.opening
+            && let Some(source) = &self.source_file
+        {
+            proxy::save_resume(source, self.current_frame);
+        }
     }
 }
 
@@ -1174,7 +1259,7 @@ impl eframe::App for FramePlayerApp {
         self.drain_decoder(&ctx);
         self.drain_proxy();
         // 续播：当前帧变化且距上次写盘 >0.3s 时记录播放位置（关掉/下次打开从这里续）
-        if self.total_frames > 0 && self.current_frame != self.resume_saved_frame {
+        if self.total_frames > 0 && !self.opening && self.current_frame != self.resume_saved_frame {
             let now = ctx.input(|i| i.time);
             if now - self.resume_saved_t > 0.3 {
                 if let Some(src) = self.source_file.clone() {
@@ -1866,4 +1951,169 @@ fn install_fonts(ctx: &egui::Context) {
     }
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Requests = crossbeam_channel::Receiver<(u64, ToDecoder)>;
+    type Responses = crossbeam_channel::Sender<(u64, FromDecoder)>;
+
+    fn test_app() -> (FramePlayerApp, Requests, Responses) {
+        let (to, requests) = crossbeam_channel::unbounded();
+        let (responses, from) = crossbeam_channel::unbounded();
+        let (_, hook_rx) = crossbeam_channel::unbounded();
+        (
+            FramePlayerApp::with_services(
+                DecoderHandle::new(to, from),
+                hook_rx,
+                Config::default(),
+                None,
+            ),
+            requests,
+            responses,
+        )
+    }
+
+    #[test]
+    fn resume_requests_the_saved_frame() {
+        let (mut app, requests, responses) = test_app();
+        app.pending_resume = Some(42);
+        responses
+            .send((
+                0,
+                FromDecoder::Opened {
+                    total_frames: 100,
+                    fps: 25.0,
+                    width: 2,
+                    height: 2,
+                    keyframes: 100,
+                },
+            ))
+            .unwrap();
+        app.drain_decoder(&egui::Context::default());
+        assert!(matches!(
+            requests.try_recv(),
+            Ok((0, ToDecoder::GetFrame(42)))
+        ));
+    }
+
+    #[test]
+    fn opening_a_file_clears_previous_playback_state() {
+        let (mut app, _, _) = test_app();
+        app.total_frames = 100;
+        app.current_frame = 42;
+        app.playing = true;
+        app.pending = true;
+        app.pending_req = Some((43, true));
+        app.holding = Some(1);
+        app.open_path(PathBuf::from("missing-video-for-test.mp4"));
+        assert_eq!(app.total_frames, 0);
+        assert!(!app.playing);
+        assert!(app.pending_req.is_none());
+        assert!(app.holding.is_none());
+    }
+
+    fn opened(total_frames: u64) -> FromDecoder {
+        FromDecoder::Opened {
+            total_frames,
+            fps: 25.0,
+            width: 2,
+            height: 2,
+            keyframes: total_frames,
+        }
+    }
+
+    fn frame(index: u64) -> FromDecoder {
+        FromDecoder::Frame(Arc::new(crate::msg::FrameRgba {
+            width: 2,
+            height: 2,
+            pixels: vec![255; 16],
+            index,
+        }))
+    }
+
+    #[test]
+    fn old_messages_cannot_change_the_new_video_or_complete_its_request() {
+        let (mut app, requests, responses) = test_app();
+        let ctx = egui::Context::default();
+        app.open_decoder("first.mp4".into());
+        let (old, _) = requests.recv().unwrap();
+        app.pending_resume = Some(42);
+        app.open_decoder("second.mp4".into());
+        let (new, _) = requests.recv().unwrap();
+        responses.send((old, opened(1000))).unwrap();
+        responses.send((new, opened(100))).unwrap();
+        responses.send((old, frame(70))).unwrap();
+        responses
+            .send((old, FromDecoder::Error("旧文件错误".into())))
+            .unwrap();
+        app.drain_decoder(&ctx);
+        assert_eq!(app.total_frames, 100);
+        assert!(app.opening && app.pending);
+        assert!(app.tex.is_none());
+        assert!(app.status.is_empty());
+        assert!(matches!(requests.try_recv(), Ok((g, ToDecoder::GetFrame(42))) if g == new));
+        responses.send((new, frame(42))).unwrap();
+        app.drain_decoder(&ctx);
+        assert_eq!(app.current_frame, 42);
+        assert!(!app.opening && !app.pending);
+        assert!(app.tex.is_some());
+    }
+
+    #[test]
+    fn initial_frame_is_requested_and_resume_is_clamped() {
+        for (saved, expected) in [(None, 0), (Some(500), 99)] {
+            let (mut app, requests, responses) = test_app();
+            app.pending_resume = saved;
+            responses.send((0, opened(100))).unwrap();
+            app.drain_decoder(&egui::Context::default());
+            assert!(
+                matches!(requests.try_recv(), Ok((0, ToDecoder::GetFrame(f))) if f == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_proxy_falls_back_without_losing_the_resume_target() {
+        let (mut app, requests, responses) = test_app();
+        app.source_file = Some("missing-source-for-test.mp4".into());
+        app.using_proxy = true;
+        app.pending_resume = Some(42);
+        app.open_decoder("broken-proxy.mp4".into());
+        let (generation, _) = requests.recv().unwrap();
+        responses
+            .send((generation, FromDecoder::Error("代理损坏".into())))
+            .unwrap();
+        app.drain_decoder(&egui::Context::default());
+        let (generation, command) = requests.recv().unwrap();
+        assert!(matches!(command, ToDecoder::Open(ref p) if Some(p) == app.source_file.as_ref()));
+        assert!(!app.using_proxy);
+        responses.send((generation, opened(100))).unwrap();
+        app.drain_decoder(&egui::Context::default());
+        assert!(matches!(
+            requests.try_recv(),
+            Ok((_, ToDecoder::GetFrame(42)))
+        ));
+    }
+
+    #[test]
+    fn dropping_the_app_cancels_its_transcode() {
+        let (mut app, _, _) = test_app();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let worker_stopped = stopped.clone();
+        app.proxy_worker = Some(std::thread::spawn(move || {
+            while !worker_cancel.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            worker_stopped.store(true, Ordering::Relaxed);
+        }));
+        app.proxy_cancel = Some(cancel.clone());
+        drop(app);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(stopped.load(Ordering::Relaxed));
+    }
 }

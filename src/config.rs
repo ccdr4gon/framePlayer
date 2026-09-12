@@ -47,6 +47,16 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl Config {
+    fn normalize(&mut self) {
+        let defaults = Self::default();
+        let interval = |value: f64, fallback: f64| {
+            if value.is_finite() { value.clamp(0.001, 10.0) } else { fallback }
+        };
+        self.play_interval_s = interval(self.play_interval_s, defaults.play_interval_s);
+        self.hold_interval_s = interval(self.hold_interval_s, defaults.hold_interval_s);
+        self.bindings = normalize_bindings(&self.bindings);
+    }
+
     pub fn load() -> Self {
         let Some(path) = config_path() else {
             return Self::default();
@@ -58,7 +68,7 @@ impl Config {
             }),
             Err(_) => Self::default(),
         };
-        cfg.bindings = normalize_bindings(&cfg.bindings);
+        cfg.normalize();
         cfg
     }
 
@@ -77,5 +87,30 @@ impl Config {
             }
             Err(e) => log::warn!("序列化配置失败: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_intervals_are_safe_for_playback_timers() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, 0.0, 100.0] {
+            let mut cfg = Config {
+                play_interval_s: invalid,
+                hold_interval_s: invalid,
+                ..Config::default()
+            };
+            cfg.normalize();
+            for value in [cfg.play_interval_s, cfg.hold_interval_s] {
+                assert!((0.001..=10.0).contains(&value));
+                assert!(!std::time::Duration::from_secs_f64(value).is_zero());
+            }
+        }
+        let mut cfg = Config::default();
+        cfg.normalize();
+        assert_eq!(cfg.play_interval_s, 0.040);
+        assert_eq!(cfg.hold_interval_s, 0.050);
     }
 }
